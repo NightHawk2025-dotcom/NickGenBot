@@ -1,3 +1,5 @@
+using System.Net;
+using System.Text;
 using NickGenBot;
 using Telegram.Bot;
 using Telegram.Bot.Polling;
@@ -11,6 +13,13 @@ if (string.IsNullOrWhiteSpace(token))
     return 1;
 }
 
+if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SUPABASE_URL")) ||
+    string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SUPABASE_SERVICE_KEY")))
+{
+    Console.Error.WriteLine("Не задано SUPABASE_URL або SUPABASE_SERVICE_KEY.");
+    return 1;
+}
+
 var bot = new TelegramBotClient(token);
 
 using var cts = new CancellationTokenSource();
@@ -19,6 +28,29 @@ Console.CancelKeyPress += (_, e) =>
     e.Cancel = true;
     cts.Cancel();
 };
+
+// Health-check для Render (Web Service вимагає відкритий порт) і для зовнішнього пінгу
+var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+var http = new HttpListener();
+http.Prefixes.Add($"http://*:{port}/");
+http.Start();
+_ = Task.Run(async () =>
+{
+    var body = Encoding.UTF8.GetBytes("OK");
+    while (!cts.IsCancellationRequested)
+    {
+        try
+        {
+            var ctx = await http.GetContextAsync();
+            ctx.Response.ContentType = "text/plain";
+            ctx.Response.ContentLength64 = body.Length;
+            await ctx.Response.OutputStream.WriteAsync(body);
+            ctx.Response.Close();
+        }
+        catch when (cts.IsCancellationRequested) { break; }
+        catch { /* ігноруємо поодинокі збої */ }
+    }
+});
 
 var me = await bot.GetMe(cts.Token);
 

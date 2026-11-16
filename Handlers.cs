@@ -87,7 +87,7 @@ public static partial class Handlers
                     break;
                 case "/shop":
                 case "/balance":
-                    var credits = Shop.Store.GetCredits(msg.From?.Id ?? chatId);
+                    var credits = await Shop.Store.GetCreditsAsync(msg.From?.Id ?? chatId, ct);
                     await SendAsync(bot, chatId, ShopText(credits), ShopKeyboard(credits), ct);
                     break;
                 case "/paysupport":

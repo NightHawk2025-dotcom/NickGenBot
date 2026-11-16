@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 
 namespace NickGenBot;
@@ -21,8 +23,7 @@ public static class Shop
         new("p5", Sets: 5, Stars: 100, Title: "Унікальні юзернейми: 5 наборів"),
     ];
 
-    public static readonly PurchaseStore Store = new(
-        Path.Combine(Environment.GetEnvironmentVariable("DATA_DIR") ?? "data", "credits.json"));
+    public static readonly SupabaseStore Store = SupabaseStore.FromEnvironment();
 
     public static Pack? Find(string id) => Packs.FirstOrDefault(p => p.Id == id);
 
@@ -40,90 +41,68 @@ public static class Shop
     }
 }
 
-/// <summary>Баланс наборів і журнал покупок у JSON-файлі.</summary>
-public sealed class PurchaseStore
+/// <summary>
+/// Баланс наборів і журнал покупок у Supabase (Postgres). Уся логіка атомарна на боці БД
+/// (RPC-функції з supabase.sql), тому подвійне списання/зарахування неможливе.
+/// </summary>
+public sealed class SupabaseStore
 {
-    public sealed class Purchase
+    private readonly HttpClient _http;
+
+    public SupabaseStore(string url, string key)
     {
-        public long UserId { get; set; }
-        public string ChargeId { get; set; } = "";
-        public int Stars { get; set; }
-        public int Sets { get; set; }
-        public DateTime At { get; set; }
+        _http = new HttpClient
+        {
+            BaseAddress = new Uri(url.TrimEnd('/') + "/rest/v1/rpc/"),
+            Timeout = TimeSpan.FromSeconds(10),
+        };
+        _http.DefaultRequestHeaders.Add("apikey", key);
+
+        // Старі ключі — це JWT (eyJ...), їх треба слати ще й як Bearer. Нові sb_secret_... — лише apikey.
+        if (key.StartsWith("eyJ", StringComparison.Ordinal))
+            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", key);
     }
 
-    public sealed class Data
-    {
-        public Dictionary<long, int> Credits { get; set; } = new();
-        public List<Purchase> Purchases { get; set; } = new();
-    }
+    public static SupabaseStore FromEnvironment() => new(
+        Environment.GetEnvironmentVariable("SUPABASE_URL")!,
+        Environment.GetEnvironmentVariable("SUPABASE_SERVICE_KEY")!);
 
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-
-    private readonly object _gate = new();
-    private readonly string _path;
-    private readonly Data _data;
-
-    public PurchaseStore(string path)
-    {
-        _path = path;
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        _data = File.Exists(path)
-            ? JsonSerializer.Deserialize<Data>(File.ReadAllText(path)) ?? new Data()
-            : new Data();
-    }
-
-    public int GetCredits(long userId)
-    {
-        lock (_gate) return _data.Credits.GetValueOrDefault(userId);
-    }
+    public Task<int> GetCreditsAsync(long userId, CancellationToken ct) =>
+        RpcAsync<int>("get_credits", new { p_user = userId }, retry: true, ct);
 
     /// <summary>Зараховує покупку. false — якщо цей платіж уже зараховано (повторна доставка).</summary>
-    public bool AddPurchase(long userId, Pack pack, string chargeId)
-    {
-        lock (_gate)
-        {
-            if (_data.Purchases.Any(p => p.ChargeId == chargeId)) return false;
+    public Task<bool> AddPurchaseAsync(long userId, Pack pack, string chargeId, CancellationToken ct) =>
+        RpcAsync<bool>("add_purchase",
+            new { p_user = userId, p_charge = chargeId, p_stars = pack.Stars, p_sets = pack.Sets },
+            retry: true, ct); // безпечно повторювати: charge_id унікальний
 
-            _data.Purchases.Add(new Purchase
+    public Task<bool> TryConsumeAsync(long userId, CancellationToken ct) =>
+        RpcAsync<bool>("try_consume", new { p_user = userId }, retry: false, ct);
+
+    public Task<bool> RefundAsync(long userId, CancellationToken ct) =>
+        RpcAsync<bool>("refund_set", new { p_user = userId }, retry: false, ct);
+
+    private async Task<T> RpcAsync<T>(string fn, object args, bool retry, CancellationToken ct)
+    {
+        var attempts = retry ? 3 : 1;
+
+        for (var i = 1; ; i++)
+        {
+            try
             {
-                UserId = userId,
-                ChargeId = chargeId,
-                Stars = pack.Stars,
-                Sets = pack.Sets,
-                At = DateTime.UtcNow,
-            });
-            _data.Credits[userId] = _data.Credits.GetValueOrDefault(userId) + pack.Sets;
-            Save();
-            return true;
-        }
-    }
+                using var content = new StringContent(JsonSerializer.Serialize(args), Encoding.UTF8, "application/json");
+                using var resp = await _http.PostAsync(fn, content, ct);
+                var body = await resp.Content.ReadAsStringAsync(ct);
 
-    public bool TryConsume(long userId)
-    {
-        lock (_gate)
-        {
-            var have = _data.Credits.GetValueOrDefault(userId);
-            if (have <= 0) return false;
-            _data.Credits[userId] = have - 1;
-            Save();
-            return true;
-        }
-    }
+                if (!resp.IsSuccessStatusCode)
+                    throw new HttpRequestException($"Supabase {fn}: {(int)resp.StatusCode} {body}");
 
-    public void Refund(long userId)
-    {
-        lock (_gate)
-        {
-            _data.Credits[userId] = _data.Credits.GetValueOrDefault(userId) + 1;
-            Save();
+                return JsonSerializer.Deserialize<T>(body)!;
+            }
+            catch (Exception) when (i < attempts && !ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * i), ct);
+            }
         }
-    }
-
-    private void Save()
-    {
-        var tmp = _path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(_data, JsonOptions));
-        File.Move(tmp, _path, overwrite: true);
     }
 }

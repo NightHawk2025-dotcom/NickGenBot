@@ -69,7 +69,7 @@ public static partial class Handlers
                 break;
 
             default:
-                var credits = Shop.Store.GetCredits(userId);
+                var credits = await Shop.Store.GetCreditsAsync(userId, ct);
                 await EditAsync(bot, msg, ShopText(credits), ShopKeyboard(credits), ct);
                 break;
         }
@@ -112,8 +112,8 @@ public static partial class Handlers
             return;
         }
 
-        Shop.Store.AddPurchase(userId, pack, pay.TelegramPaymentChargeId);
-        var credits = Shop.Store.GetCredits(userId);
+        await Shop.Store.AddPurchaseAsync(userId, pack, pay.TelegramPaymentChargeId, ct);
+        var credits = await Shop.Store.GetCreditsAsync(userId, ct);
 
         var kb = new InlineKeyboardMarkup(
         [
@@ -132,7 +132,7 @@ public static partial class Handlers
 
         try
         {
-            if (!Shop.Store.TryConsume(userId))
+            if (!await Shop.Store.TryConsumeAsync(userId, ct))
             {
                 await SendAsync(bot, chatId, "😕 У тебе немає наборів.\n\n" + ShopText(0), ShopKeyboard(0), ct);
                 return;
@@ -147,15 +147,15 @@ public static partial class Handlers
             }
             catch
             {
-                Shop.Store.Refund(userId);
+                await Shop.Store.RefundAsync(userId, CancellationToken.None);
                 throw;
             }
 
             // Не набрали повний набір — не списуємо
             var complete = found.Count >= Shop.SetSize;
-            if (!complete) Shop.Store.Refund(userId);
+            if (!complete) await Shop.Store.RefundAsync(userId, CancellationToken.None);
 
-            var credits = Shop.Store.GetCredits(userId);
+            var credits = await Shop.Store.GetCreditsAsync(userId, ct);
 
             var sb = new StringBuilder();
             sb.AppendLine("💎 <b>Унікальні юзернейми</b>");
